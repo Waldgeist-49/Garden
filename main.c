@@ -47,6 +47,18 @@ void obtain_time() {
     ESP_LOGI(TAG_TIME, "Current time: %s", asctime(&timeinfo));
 }
 
+void get_sensor_data_string(char *out, size_t maxlen) {
+    float temp = bmp280_read_temperature();
+    float pressure = bmp280_read_pressure();
+    float soil0 = ads1115_read_channel(0);
+    float soil1 = ads1115_read_channel(1);
+
+    snprintf(out, maxlen,
+             "{\"temperature\": %.2f, \"pressure\": %.2f, \"soil0\": %.2f, \"soil1\": %.2f}",
+             temp, pressure, soil0, soil1);
+}
+
+
 // === Обработчик HTTP-запроса к /time ===
 esp_err_t time_get_handler(httpd_req_t *req) {
     time_t now;

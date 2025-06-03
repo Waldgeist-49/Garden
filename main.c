@@ -48,14 +48,16 @@ void obtain_time() {
 }
 
 void get_sensor_data_string(char *out, size_t maxlen) {
-    float temp = bmp280_read_temperature();
-    float pressure = bmp280_read_pressure();
-    float soil0 = ads1115_read_channel(0);
-    float soil1 = ads1115_read_channel(1);
+    int16_t soil0 = ads1115_read_channel(0);
+    int16_t soil1 = ads1115_read_channel(1);
+
+    int32_t temperature;
+    uint32_t pressure;
+    bmp280_init_and_read(&temperature, &pressure);
 
     snprintf(out, maxlen,
-             "{\"temperature\": %.2f, \"pressure\": %.2f, \"soil0\": %.2f, \"soil1\": %.2f}",
-             temp, pressure, soil0, soil1);
+             "{\"temperature\": %.2f, \"pressure\": %.2f, \"soil0\": %d, \"soil1\": %d}",
+             temperature / 100.0, pressure / 100.0, soil0, soil1);
 }
 
 

@@ -6,7 +6,6 @@
 #include "esp_sntp.h"
 #include "bmp280_reader.h"
 #include "ads1115_reader.h"
-#include "sensors.h"
 #include "esp_http_server.h"
 #include "wifi_connect.h"     // ✅ Подключаем твой Wi-Fi модуль
 

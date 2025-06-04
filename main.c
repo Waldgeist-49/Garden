@@ -6,11 +6,16 @@
 #include "esp_sntp.h"
 #include "bmp280_reader.h"
 #include "ads1115_reader.h"
+#include "i2c_scanner.h"
 #include "esp_http_server.h"
-#include "wifi_connect.h"     // ✅ Подключаем твой Wi-Fi модуль
+#include "wifi_connect.h"
+
+// Добавим прототип для i2c_init, чтобы инициализировать I2C централизованно
+// Это необходимо, чтобы i2c_scanner мог работать, если ads1115_init_if_needed() еще не вызван
+void i2c_bus_init_once();
 
 static const char *TAG_TIME = "NTP_TIME";
-
+static const char *TAG_MAIN = "MAIN_APP";
 
 // === Ожидание синхронизации времени ===
 void wait_for_time_sync() {
@@ -35,7 +40,9 @@ void obtain_time() {
     esp_sntp_init();
     wait_for_time_sync();
 
-    // Устанавливаем временную зону для Украины
+    // Установка часового пояса (например, для Киева/Одессы)
+    // Проверьте правильность строки "EET-2EEST,M3.5.0/3,M10.5.0/4" для вашего региона.
+    // Если вам нужен только UTC, можно опустить эти строки.
     setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
     tzset();
 
@@ -46,20 +53,6 @@ void obtain_time() {
 
     ESP_LOGI(TAG_TIME, "Current time: %s", asctime(&timeinfo));
 }
-
-void get_sensor_data_string(char *out, size_t maxlen) {
-    int16_t soil0 = ads1115_read_channel(0);
-    int16_t soil1 = ads1115_read_channel(1);
-
-    int32_t temperature;
-    uint32_t pressure;
-    bmp280_init_and_read(&temperature, &pressure);
-
-    snprintf(out, maxlen,
-             "{\"temperature\": %.2f, \"pressure\": %.2f, \"soil0\": %d, \"soil1\": %d}",
-             temperature / 100.0, pressure / 100.0, soil0, soil1);
-}
-
 
 // === Обработчик HTTP-запроса к /time ===
 esp_err_t time_get_handler(httpd_req_t *req) {
@@ -75,30 +68,39 @@ esp_err_t time_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-esp_err_t sensor_handler(httpd_req_t *req) {
-    int16_t ch0 = ads1115_read_channel(0);
-    int16_t ch1 = ads1115_read_channel(1);
-
-    int32_t temperature;
-    uint32_t pressure;
-    bmp280_init_and_read(&temperature, &pressure);
-
-    char response[200];
-    snprintf(response, sizeof(response),
-             "{\"A0\": %d, \"A1\": %d, \"temp\": %.2f, \"press\": %.2f}",
-             ch0, ch1, temperature / 100.0, pressure / 100.0);
-
+// === Обработчик HTTP-запроса к /i2c_scan ===
+esp_err_t i2c_scan_handler(httpd_req_t *req) {
+    char result[256];
+    // Убедимся, что I2C-шина инициализирована перед сканированием
+    // Хотя ads1115_init_if_needed() вызывается в ads1115_read_channel(),
+    // для сканера I2C лучше иметь уверенность, что драйвер запущен.
+    // В данном случае, i2c_bus_init_once() будет вызвана в app_main.
+    scan_i2c_bus(result, sizeof(result));
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, result, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
+// === Обработчик HTTP-запроса к /sensors ===
+esp_err_t sensor_handler(httpd_req_t *req) {
+    // Внимание: ads1115_init_if_needed() будет вызвана внутри ads1115_read_channel().
+    // Если I2C уже инициализирован в app_main, она просто вернется.
+    int16_t ch0 = ads1115_read_channel(0);
+    int16_t ch1 = ads1115_read_channel(1);
 
+    int32_t temperature_comp;
+    uint32_t pressure_comp;
+    // Используем новую функцию для чтения BMP280, которая включает компенсацию
+    bmp280_read_compensated_data(&temperature_comp, &pressure_comp);
 
-esp_err_t sensors_get_handler(httpd_req_t *req) {
-    char sensor_data[128];
-    get_sensor_data_string(sensor_data, sizeof(sensor_data));
-    httpd_resp_send(req, sensor_data, HTTPD_RESP_USE_STRLEN);
+    char response[200];
+    // Делим на 100.0, так как функции чтения BMP280 будут возвращать значения с двумя знаками после запятой
+    snprintf(response, sizeof(response),
+             "{\"A0\": %d, \"A1\": %d, \"temp\": %.2f, \"press\": %.2f}",
+             ch0, ch1, (float)temperature_comp / 100.0, (float)pressure_comp / 100.0);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -106,36 +108,108 @@ esp_err_t sensors_get_handler(httpd_req_t *req) {
 void start_web_server() {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 4096; // Увеличить размер стека для HTTPD, если возникают проблемы
 
-    httpd_start(&server, &config);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        ESP_LOGI("HTTP", "Server started on port %d", config.server_port); // Исправлено: config.server_port вместо config.uri_match_fn
 
+        httpd_uri_t time_uri = {
+            .uri       = "/time",
+            .method    = HTTP_GET,
+            .handler   = time_get_handler,
+            .user_ctx  = NULL
+        };
+        httpd_uri_t sensors_uri = {
+            .uri       = "/sensors",
+            .method    = HTTP_GET,
+            .handler   = sensor_handler,
+            .user_ctx  = NULL
+        };
+        httpd_uri_t i2c_scan_uri = {
+            .uri       = "/i2c_scan",
+            .method    = HTTP_GET,
+            .handler   = i2c_scan_handler,
+            .user_ctx  = NULL
+        };
 
-    httpd_uri_t time_uri = {
-        .uri       = "/time",
-        .method    = HTTP_GET,
-        .handler   = time_get_handler,
-        .user_ctx  = NULL
+        httpd_register_uri_handler(server, &i2c_scan_uri);
+        httpd_register_uri_handler(server, &time_uri);
+        httpd_register_uri_handler(server, &sensors_uri);
+    } else {
+        ESP_LOGE("HTTP", "Failed to start server!");
+    }
+}
+
+// === Централизованная инициализация I2C-шины ===
+// Это чтобы i2c_scanner мог работать независимо от ads1115_reader
+static bool i2c_master_initialized = false;
+void i2c_bus_init_once() {
+    if (i2c_master_initialized) {
+        return;
+    }
+
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO, // Используем дефайны из ads1115_reader.h
+        .scl_io_num = I2C_MASTER_SCL_IO, // Используем дефайны из ads1115_reader.h
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ, // Используем дефайны из ads1115_reader.h
     };
-    httpd_uri_t sensors_uri = {
-        .uri       = "/sensors",
-        .method    = HTTP_GET,
-        .handler   = sensor_handler,
-        .user_ctx  = NULL
-    };
-    httpd_register_uri_handler(server, &sensors_uri);
-    httpd_register_uri_handler(server, &time_uri);
+
+    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf); // Используем дефайны из ads1115_reader.h
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG_MAIN, "i2c_param_config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG_MAIN, "i2c_driver_install failed: %s", esp_err_to_name(err));
+        return;
+    }
+    i2c_master_initialized = true;
+    ESP_LOGI(TAG_MAIN, "I2C master driver initialized.");
 }
 
 
-
 // === Точка входа ===
-void app_main() {
-    ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_init_sta();        // Подключаемся к Wi-Fi
-    obtain_time();          // Получаем время через NTP
-    init_ads1115();
-    start_web_server();     // Запускаем веб-сервер
-    int32_t temp;
-    uint32_t pres;
-    bmp280_init_and_read(&temp, &pres);
+void app_main(void) {
+    // 1. Инициализация NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 2. Инициализация I2C-шины (для ADS1115 и сканера)
+    i2c_bus_init_once(); // Вызываем здесь, чтобы I2C был готов для сканера
+
+    // 3. Инициализация Wi-Fi
+    wifi_init_sta();
+
+    // 4. Получение времени через SNTP
+    obtain_time();
+
+    // 5. Запуск веб-сервера
+    start_web_server();
+
+    // Основной цикл приложения (если нужны какие-то периодические действия, кроме веб-сервера)
+    // Веб-сервер и другие задачи FreeRTOS будут работать в фоновом режиме.
+    while (1) {
+        // Пример: Вывод данных ADS1115 в консоль каждые 5 секунд
+        // Если вам не нужен постоянный вывод в консоль, можно удалить или изменить эту часть.
+        int16_t val0 = ads1115_read_channel(0);
+        int16_t val1 = ads1115_read_channel(1);
+        printf("CH0: %d | CH1: %d\n", val0, val1);
+
+        // Пример: Вывод данных BMP280 в консоль
+        int32_t temperature_console;
+        uint32_t pressure_console;
+        bmp280_read_compensated_data(&temperature_console, &pressure_console);
+        printf("TEMP: %.2f C | PRESS: %.2f hPa\n", (float)temperature_console / 100.0, (float)pressure_console / 100.0);
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Задержка 5 секунд
+    }
 }
